@@ -1,0 +1,458 @@
+---
+title: "Can Money Buy Happiness?"
+subtitle: "What 3,400 Americans told the 2024 General Social Survey"
+author: "Xuechun Zhao"
+format:
+  closeread-html:
+    remove-header-space: false
+    cr-style:
+      narrative-background-color-sidebar: "#F7F4EE"
+      narrative-text-color-sidebar: "#1F2328"
+      section-background-color: "#FFFFFF"
+    embed-resources: true
+execute:
+  echo: false
+  message: false
+  warning: false
+---
+
+```{r}
+#| label: setup
+#| include: false
+
+library(haven)
+library(dplyr)
+library(ggplot2)
+library(survey)
+library(srvyr)
+library(MASS, exclude = "select")
+
+options(survey.lonely.psu = "adjust", dplyr.summarise.inform = FALSE)
+set.seed(702)
+
+ink <- "#1F2328"; muted <- "#8A8F98"; accent <- "#C2571A"; cool <- "#2B6A8F"
+theme_set(
+  theme_minimal(base_size = 16) +
+    theme(panel.grid.minor = element_blank(),
+          panel.grid.major.x = element_blank(),
+          plot.title = element_text(face = "bold", colour = ink),
+          plot.subtitle = element_text(colour = muted),
+          axis.text = element_text(colour = ink),
+          plot.title.position = "plot")
+)
+
+raw <- read_dta("../2024/GSS2024.dta")
+num <- function(x) as.numeric(zap_missing(x))
+inc_labs <- c("Under\n$25k", "$25k-\n$50k", "$50k-\n$75k", "$75k-\n$110k", "$110k+")
+
+gss <- raw |>
+  transmute(
+    happy = num(happy), income16 = num(income16), sex = num(sex),
+    age = num(age), degree = num(degree), marital = num(marital),
+    wrkstat = num(wrkstat), race = num(race),
+    vstrat = num(vstrat), vpsu = num(vpsu), w = num(wtssnrps_as)
+  ) |>
+  mutate(
+    happy_ord = factor(4 - happy, levels = 1:3,
+                       labels = c("Not too happy", "Pretty happy", "Very happy"),
+                       ordered = TRUE),
+    inc_grp = cut(income16, c(0, 14, 18, 20, 22, 26), labels = inc_labs),
+    inc_num = as.numeric(inc_grp),
+    female = as.numeric(sex == 2),
+    age_c = (age - 45) / 10,
+    degree_f = factor(degree, 0:4, c("Less than high school", "High school",
+                                     "Associate", "Bachelor's", "Graduate")),
+    marital_f = factor(case_when(marital == 1 ~ "Married", marital == 2 ~ "Widowed",
+                                 marital %in% 3:4 ~ "Divorced/separated",
+                                 marital == 5 ~ "Never married"),
+                       levels = c("Married", "Widowed", "Divorced/separated", "Never married")),
+    work_f = factor(case_when(wrkstat %in% c(1, 3) ~ "Full time",
+                              wrkstat == 2 ~ "Part time",
+                              wrkstat == 4 ~ "Unemployed",
+                              wrkstat == 5 ~ "Retired",
+                              wrkstat %in% 6:8 ~ "Other not working"),
+                    levels = c("Full time", "Part time", "Unemployed", "Retired",
+                               "Other not working")),
+    race_f = factor(race, 1:3, c("White", "Black", "Other"))
+  )
+
+model_vars <- c("happy_ord", "inc_num", "female", "age", "degree_f",
+                "marital_f", "work_f", "race_f")
+gss <- gss |> mutate(cc = if_all(all_of(model_vars), ~ !is.na(.x)))
+cc <- filter(gss, cc)
+des <- gss |>
+  as_survey_design(ids = vpsu, strata = vstrat, weights = w, nest = TRUE) |>
+  subset(cc)
+
+f_demo <- happy_ord ~ inc_num * female + age_c + I(age_c^2) + race_f
+f_full <- update(f_demo, . ~ . + degree_f + marital_f + work_f)
+m_demo <- svyolr(f_demo, design = des)
+m_full <- svyolr(f_full, design = des)
+
+# ---- weighted descriptives by income group ----
+by_inc <- des |>
+  group_by(inc_grp) |>
+  summarise(very = survey_mean(happy_ord == "Very happy", vartype = NULL),
+            not = survey_mean(happy_ord == "Not too happy", vartype = NULL),
+            married = survey_mean(marital_f == "Married", vartype = NULL),
+            fulltime = survey_mean(work_f == "Full time", vartype = NULL)) |>
+  mutate(across(-inc_grp, ~ 100 * .x))
+pct <- function(col, k) paste0(round(by_inc[[col]][k]), "%")
+
+# ---- counterfactual average predicted P(very happy) ----
+nbeta <- function(m) sum(!grepl("\\|", names(coef(m))))
+cf_very <- function(m, f, setter, nsim = 500) {
+  rhs <- delete.response(terms(f))
+  nb <- nbeta(m)
+  draws <- rbind(coef(m), MASS::mvrnorm(nsim, coef(m), vcov(m)))
+  nd <- setter(cc)
+  X <- model.matrix(rhs, nd)[, names(coef(m))[1:nb], drop = FALSE]
+  wt <- nd$w / sum(nd$w)
+  res <- apply(draws, 1, function(p) {
+    eta <- drop(X %*% p[1:nb])
+    sum(wt * (1 - plogis(p[nb + 2] - eta)))
+  })
+  c(est = 100 * res[1], lo = 100 * quantile(res[-1], .025),
+    hi = 100 * quantile(res[-1], .975))
+}
+mar_lv <- levels(cc$marital_f); wrk_lv <- levels(cc$work_f)
+set_inc <- function(k) function(d) mutate(d, inc_num = k)
+set_mar <- function(v) function(d) mutate(d, marital_f = factor(v, mar_lv))
+set_wrk <- function(v) function(d) mutate(d, work_f = factor(v, wrk_lv))
+
+levers <- bind_rows(
+  data.frame(lever = "Income", from = "Lowest group", to = "Highest group",
+             rbind(cf_very(m_full, f_full, set_inc(1)), cf_very(m_full, f_full, set_inc(5))) |>
+               as.data.frame() |> mutate(end = c("from", "to"))),
+  data.frame(lever = "Marriage", from = "Never married", to = "Married",
+             rbind(cf_very(m_full, f_full, set_mar("Never married")),
+                   cf_very(m_full, f_full, set_mar("Married"))) |>
+               as.data.frame() |> mutate(end = c("from", "to"))),
+  data.frame(lever = "Work", from = "Unemployed", to = "Full time",
+             rbind(cf_very(m_full, f_full, set_wrk("Unemployed")),
+                   cf_very(m_full, f_full, set_wrk("Full time"))) |>
+               as.data.frame() |> mutate(end = c("from", "to")))
+)
+names(levers)[4:6] <- c("est", "lo", "hi")
+gap <- levers |> group_by(lever) |> summarise(g = diff(est))
+gp <- function(l) paste0(round(gap$g[gap$lever == l]), " points")
+
+# income ORs for the reveal
+or_inc <- function(m) {
+  b <- coef(m)["inc_num"]; se <- sqrt(diag(vcov(m)))["inc_num"]
+  d <- degf(des) - nbeta(m)
+  c(or = exp(b), lo = exp(b - qt(.975, d) * se), hi = exp(b + qt(.975, d) * se))
+}
+ors <- rbind(or_inc(m_demo), or_inc(m_full)) |> as.data.frame()
+names(ors) <- c("or", "lo", "hi")
+ors$model <- factor(c("Comparing people of\nthe same age and race",
+                      "...and also the same\nmarriage, work, education"),
+                    levels = c("...and also the same\nmarriage, work, education",
+                               "Comparing people of\nthe same age and race"))
+
+# income x sex predicted curves
+sex_grid <- expand.grid(k = 1:5, fem = 0:1)
+sex_curve <- bind_rows(lapply(seq_len(nrow(sex_grid)), function(i) {
+  kk <- sex_grid$k[i]; ff <- sex_grid$fem[i]
+  r <- cf_very(m_full, f_full, function(d) mutate(d, inc_num = kk, female = ff), nsim = 300)
+  data.frame(k = kk, female = ff, est = r[1], lo = r[2], hi = r[3])
+})) |>
+  mutate(sex = factor(female, 0:1, c("Men", "Women")))
+sex_gap <- sex_curve |> group_by(sex) |> summarise(rise = est[k == 5] - est[k == 1])
+
+# ---- grid for the interactive tool: average predicted probabilities for
+# every income x marital x work x sex profile, averaged over everyone's
+# age, race and education (point estimates) ----
+tool_probs <- function(m, f, inc, mar, wrk, fem) {
+  rhs <- delete.response(terms(f)); nb <- nbeta(m); p <- coef(m)
+  nd <- mutate(cc, inc_num = inc, female = fem,
+               marital_f = factor(mar, mar_lv), work_f = factor(wrk, wrk_lv))
+  X <- model.matrix(rhs, nd)[, names(p)[1:nb], drop = FALSE]
+  eta <- drop(X %*% p[1:nb]); wt <- nd$w / sum(nd$w)
+  p1 <- plogis(p[nb + 1] - eta); p2 <- plogis(p[nb + 2] - eta)
+  c(not = sum(wt * p1), pretty = sum(wt * (p2 - p1)), very = sum(wt * (1 - p2)))
+}
+tool_grid <- expand.grid(inc = 1:5, mar = mar_lv, wrk = wrk_lv, fem = 0:1,
+                         stringsAsFactors = FALSE)
+tool_grid <- cbind(tool_grid, t(mapply(function(a, b, c, d) tool_probs(m_full, f_full, a, b, c, d),
+                                       tool_grid$inc, tool_grid$mar, tool_grid$wrk, tool_grid$fem)))
+tool_grid[c("not", "pretty", "very")] <- round(100 * tool_grid[c("not", "pretty", "very")], 1)
+avg_very <- round(100 * svymean(~ I(happy_ord == "Very happy"), des)[2])
+```
+
+Ask anyone whether money buys happiness and you will hear two answers. "Of course not." And, a bit quieter: "It sure helps."
+
+The General Social Survey has asked Americans one simple question since 1972: *"Taken all together, how would you say things are these days — would you say that you are very happy, pretty happy, or not too happy?"*
+
+In 2024, `r format(nrow(cc), big.mark = ",")` adults answered it and told us their family income. Let's see what they said.
+
+:::::{.cr-section}
+
+Start with the simplest picture. Each bar is a slice of America by family income, and its height is the share of people who call themselves **very happy**. @cr-very
+
+The pattern looks clear. Among families earning under \$25,000, `r pct("very", 1)` are very happy. Among families earning \$110,000 or more, `r pct("very", 5)` are. @cr-very
+
+Unhappiness tells the same story in reverse: `r pct("not", 1)` of the lowest-income group say they are "not too happy", against `r pct("not", 5)` at the top. @cr-not
+
+So, case closed? Money buys happiness? Not so fast. @cr-not
+
+:::{#cr-very}
+```{r}
+#| fig-width: 7
+#| fig-height: 5
+ggplot(by_inc, aes(inc_grp, very)) +
+  geom_col(fill = cool, width = .7) +
+  geom_text(aes(label = paste0(round(very), "%")), vjust = -.4, size = 5.5, colour = ink) +
+  scale_y_continuous(limits = c(0, 40), labels = \(x) paste0(x, "%")) +
+  labs(x = "Family income", y = NULL, title = "Share who are \"very happy\"",
+       subtitle = "Weighted to represent U.S. adults, GSS 2024")
+```
+:::
+
+:::{#cr-not}
+```{r}
+#| fig-width: 7
+#| fig-height: 5
+ggplot(by_inc, aes(inc_grp, not)) +
+  geom_col(fill = accent, width = .7) +
+  geom_text(aes(label = paste0(round(not), "%")), vjust = -.4, size = 5.5, colour = ink) +
+  scale_y_continuous(limits = c(0, 40), labels = \(x) paste0(x, "%")) +
+  labs(x = "Family income", y = NULL, title = "Share who are \"not too happy\"",
+       subtitle = "Weighted to represent U.S. adults, GSS 2024")
+```
+:::
+
+:::::
+
+## Money travels with company
+
+:::::{.cr-section}
+
+Income does not arrive alone. Who earns \$110,000 a year? Often, it is **two** people. @cr-married
+
+Only `r pct("married", 1)` of adults in the lowest-income group are married. In the highest group, `r pct("married", 5)` are. A second paycheck pushes a household up the income ladder, and a partner is one of the strongest predictors of happiness researchers know of. @cr-married
+
+Work follows the same climb. Full-time employment rises from `r pct("fulltime", 1)` at the bottom of the income ladder to `r pct("fulltime", 5)` at the top. Having a job brings money, but also routine, purpose and people. @cr-work
+
+So when we see richer people reporting more happiness, we may be seeing marriage and work, not money itself. @cr-work
+
+:::{#cr-married}
+```{r}
+#| fig-width: 7
+#| fig-height: 5
+ggplot(by_inc, aes(inc_grp, married)) +
+  geom_col(fill = muted, width = .7) +
+  geom_text(aes(label = paste0(round(married), "%")), vjust = -.4, size = 5.5, colour = ink) +
+  scale_y_continuous(limits = c(0, 85), labels = \(x) paste0(x, "%")) +
+  labs(x = "Family income", y = NULL, title = "Share who are married")
+```
+:::
+
+:::{#cr-work}
+```{r}
+#| fig-width: 7
+#| fig-height: 5
+ggplot(by_inc, aes(inc_grp, fulltime)) +
+  geom_col(fill = muted, width = .7) +
+  geom_text(aes(label = paste0(round(fulltime), "%")), vjust = -.4, size = 5.5, colour = ink) +
+  scale_y_continuous(limits = c(0, 85), labels = \(x) paste0(x, "%")) +
+  labs(x = "Family income", y = NULL, title = "Share working full time")
+```
+:::
+
+:::::
+
+## Untangling the knot
+
+:::::{.cr-section}
+
+To separate money from its companions, we fit a statistical model that compares people who are alike in everything *except* income. The question becomes: among people with the same age, race, marital status, job situation and education, does more income still mean more happiness? @cr-or
+
+The top dot compares people who share only age and race. Each step up the five income groups goes with about `r round(100 * (ors$or[1] - 1))`% higher odds of being in a happier category, and the line (a 95% confidence interval) stays clear of "no effect". @cr-or
+
+Now also match people on marriage, work and education. The income effect shrinks to `r round(100 * (ors$or[2] - 1))`%, and its interval crosses the dashed line. In plain words: **we can no longer tell it apart from zero.** @cr-or
+
+:::{#cr-or}
+```{r}
+#| fig-width: 7
+#| fig-height: 4.5
+ggplot(ors, aes(or, model)) +
+  geom_vline(xintercept = 1, linetype = "dashed", colour = muted) +
+  geom_errorbarh(aes(xmin = lo, xmax = hi), height = .15, linewidth = 1.2, colour = cool) +
+  geom_point(size = 5, colour = cool) +
+  annotate("text", x = 0.99, y = 2.5, label = "no effect", hjust = 1, colour = muted, size = 4.5) +
+  scale_x_continuous(limits = c(.85, 1.4)) +
+  labs(x = "Odds ratio for one step up in income", y = NULL,
+       title = "How much does one income step matter?")
+```
+:::
+
+:::::
+
+## Money versus the other things
+
+:::::{.cr-section}
+
+Odds ratios are hard to feel. So let's run a thought experiment with the model instead. @cr-levers
+
+Imagine taking every adult in the survey and moving them from the **lowest** income group to the **highest**, while leaving everything else about their lives the same. The model predicts the share who are very happy would rise by about `r gp("Income")`. @cr-levers
+
+Now leave income alone and imagine everyone **married** instead of never married. That moves very happy by about `r gp("Marriage")`. @cr-levers
+
+And moving everyone from **unemployed to working full time** moves it by about `r gp("Work")`. @cr-levers
+
+Jumping across the entire income ladder, from under \$25k to over \$110k, does less for happiness than having a partner or a steady job. @cr-levers
+
+:::{#cr-levers}
+```{r}
+#| fig-width: 7
+#| fig-height: 5
+lv <- levers |>
+  mutate(lever = factor(lever, c("Work", "Marriage", "Income")),
+         lab = ifelse(end == "from", from, to))
+wide <- lv |> group_by(lever) |> summarise(x0 = est[end == "from"], x1 = est[end == "to"])
+ggplot(lv, aes(est, lever)) +
+  geom_segment(data = wide, aes(x = x0, xend = x1, y = lever, yend = lever),
+               inherit.aes = FALSE, linewidth = 2.5, colour = "#E3DED4") +
+  geom_point(aes(colour = end), size = 6) +
+  geom_text(aes(label = lab, colour = end, hjust = ifelse(end == "from", 1.2, -0.2)),
+            size = 4.4) +
+  scale_colour_manual(values = c(from = muted, to = accent), guide = "none") +
+  scale_x_continuous(labels = \(x) paste0(x, "%"), limits = c(0, 45)) +
+  labs(x = "Predicted share who are very happy", y = NULL,
+       title = "What moves happiness the most?",
+       subtitle = "Changing one thing for everyone, holding the rest fixed")
+```
+:::
+
+:::::
+
+## Try it yourself
+
+Pick a life and see what the model predicts. Notice how little the bars move when you change income, and how much they move when you change marriage or work.
+
+```{r}
+#| results: asis
+cat('<script>window.HAPPY_GRID = ', jsonlite::toJSON(tool_grid, dataframe = "rows"),
+    '; window.HAPPY_AVG = ', avg_very, ';</script>', sep = "")
+```
+
+```{=html}
+<div class="happy-tool" id="happy-tool">
+  <div class="tool-inputs">
+    <label>Family income
+      <select id="t-inc">
+        <option value="1">Under $25k</option><option value="2">$25k-$50k</option>
+        <option value="3" selected>$50k-$75k</option><option value="4">$75k-$110k</option>
+        <option value="5">$110k+</option>
+      </select></label>
+    <label>Marital status
+      <select id="t-mar">
+        <option>Married</option><option>Never married</option>
+        <option>Divorced/separated</option><option>Widowed</option>
+      </select></label>
+    <label>Work
+      <select id="t-wrk">
+        <option>Full time</option><option>Part time</option><option>Unemployed</option>
+        <option>Retired</option><option>Other not working</option>
+      </select></label>
+    <label>Sex
+      <select id="t-sex"><option value="1">Woman</option><option value="0">Man</option></select></label>
+  </div>
+  <p class="tool-head" id="t-head"></p>
+  <div id="t-bars"></div>
+  <p class="tool-note" id="t-note"></p>
+</div>
+<script>
+(function () {
+  var cats = [["very", "Very happy", "#C2571A"], ["pretty", "Pretty happy", "#8A8F98"],
+              ["not", "Not too happy", "#2B6A8F"]];
+  var $ = function (id) { return document.getElementById(id); };
+  var bars = $("t-bars");
+  cats.forEach(function (c) {
+    bars.insertAdjacentHTML("beforeend",
+      '<div class="tool-row"><span class="tool-k">' + c[1] + '</span>' +
+      '<span class="tool-bar"><span id="b-' + c[0] + '" style="background:' + c[2] + '"></span></span>' +
+      '<span class="tool-v" id="v-' + c[0] + '"></span></div>');
+  });
+  function update() {
+    var inc = +$("t-inc").value, mar = $("t-mar").value, wrk = $("t-wrk").value,
+        fem = +$("t-sex").value;
+    var row = window.HAPPY_GRID.find(function (d) {
+      return d.inc === inc && d.mar === mar && d.wrk === wrk && d.fem === fem; });
+    if (!row) return;
+    $("t-head").innerHTML = "A " + (fem ? "woman" : "man") + " earning <b>" +
+      $("t-inc").selectedOptions[0].text + "</b>, " + mar.toLowerCase() + ", " +
+      wrk.toLowerCase() + ":";
+    cats.forEach(function (c) {
+      $("b-" + c[0]).style.width = row[c[0]] + "%";
+      $("v-" + c[0]).textContent = Math.round(row[c[0]]) + "%";
+    });
+    $("t-note").textContent = "For comparison, " + window.HAPPY_AVG +
+      "% of all U.S. adults say they are very happy. Predictions average over everyone's age, race and education.";
+  }
+  ["t-inc", "t-mar", "t-wrk", "t-sex"].forEach(function (id) {
+    $(id).addEventListener("change", update); });
+  update();
+})();
+</script>
+```
+
+<style>
+.happy-tool { max-width: 640px; margin: 1rem auto 2rem; padding: 1.2rem 1.4rem;
+  background: #F7F4EE; border-radius: 10px; }
+.tool-head { margin: 1rem 0 .8rem; }
+.tool-inputs { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: .7rem 1rem; }
+.tool-inputs label { display: flex; flex-direction: column; font-size: .85rem; color: #6B7079; gap: .25rem; }
+.tool-inputs select { font-size: 1rem; padding: .35rem .4rem; border: 1px solid #D5CFC3;
+  border-radius: 6px; background: #fff; color: #1F2328; }
+.tool-row { display: grid; grid-template-columns: 7.5rem 1fr 3rem; gap: .6rem;
+  align-items: center; margin: .45rem 0; }
+.tool-bar { background: #E3DED4; height: 1.1rem; border-radius: 4px; overflow: hidden; }
+.tool-bar span { display: block; height: 100%; transition: width .4s ease; }
+.tool-v { text-align: right; font-variant-numeric: tabular-nums; font-weight: 600; }
+.tool-note { font-size: .85rem; color: #6B7079; margin: .8rem 0 0; }
+@media (max-width: 480px) { .tool-row { grid-template-columns: 6rem 1fr 2.6rem; }
+  .tool-inputs { grid-template-columns: 1fr; } }
+</style>
+
+## Is it different for women?
+
+:::::{.cr-section}
+
+Women's reported happiness has slipped relative to men's over recent decades, so one might expect money to matter differently by sex. @cr-sex
+
+It does not seem to. Once everything else is held fixed, women are a few points more likely than men to be very happy at every income level, but the two lines climb at the same gentle slope. Income does not matter more for one sex than the other: we found no statistical evidence of a difference. @cr-sex
+
+:::{#cr-sex}
+```{r}
+#| fig-width: 7
+#| fig-height: 5
+ggplot(sex_curve, aes(k, est, colour = sex, fill = sex)) +
+  geom_ribbon(aes(ymin = lo, ymax = hi), alpha = .15, colour = NA) +
+  geom_line(linewidth = 1.4) +
+  geom_point(size = 3) +
+  scale_x_continuous(breaks = 1:5, labels = inc_labs) +
+  scale_y_continuous(labels = \(x) paste0(x, "%"), limits = c(0, 45)) +
+  scale_colour_manual(values = c(Men = cool, Women = accent)) +
+  scale_fill_manual(values = c(Men = cool, Women = accent)) +
+  labs(x = "Family income", y = NULL, colour = NULL, fill = NULL,
+       title = "Predicted share very happy, by sex",
+       subtitle = "Holding marriage, work, education, age and race fixed") +
+  theme(legend.position = "top")
+```
+:::
+
+:::::
+
+## So, can money buy happiness?
+
+A little, perhaps, but mostly not directly. In this survey, richer Americans are happier largely because they are more likely to be married and employed. Money opens doors, but the happiness seems to live in what is behind them.
+
+That matters for policy. Programs that hand out cash, like guaranteed-income pilots, may help people in many ways, but they should not expect big jumps in happiness from the money alone. Supporting stable work and relationships may matter just as much.
+
+**A few honest caveats.** This is a snapshot of one year, so it shows associations, not causes: happy people may find partners and keep jobs more easily, too. Income is self-reported in broad brackets, and about one in ten people did not report it. And "happiness" here is a single survey question.
+
+---
+
+*Data:* NORC at the University of Chicago, General Social Survey 2024 (Release 3a). All estimates use the survey's weights and design. *Model:* survey-weighted proportional-odds (ordinal logistic) regression with an income × sex interaction, adjusting for age, race, education, marital status and employment status. Predicted shares average model predictions over all respondents. Built with R and Quarto [Closeread](https://closeread.dev).
